@@ -135,56 +135,44 @@ active_pocs() ->
     OnionKeyHash :: binary()
 ) -> false | {true, binary()} | {error, any()}.
 check_target(Challengee, BlockHash, OnionKeyHash) ->
-    LocalPOC = e2qc:cache(
-                local_pocs,
-                OnionKeyHash,
-                30,
-                fun() -> ?MODULE:local_poc(OnionKeyHash) end
-    ),
     Res =
-        case LocalPOC of
-            {error, not_found} ->
-                %% if the cache returns not found it could be the poc has not yet been initialized
-                %% so check if we have a cached local POC key.
-                %% These are added when a val HB is submitted by the local node
-                %% if such a key exists its an indication the POC may not yet have been initialized
-                %% OR the e2qc cache was called before the POC was initialised and it
-                %% has cached the {error, not_found} term
-                %% so if we have the key then check rocks again,
-                %% if still not available then its likely the POC hasnt been initialized
-                %% if found then invalidate the e2qc cache
-                case ?MODULE:local_poc_key(OnionKeyHash) of
-                    {ok, _LocalKey} ->
-                        %% the submitted key is one of this nodes local keys
-                        lager:debug(" ~p is a known key", [OnionKeyHash]),
-                        case ?MODULE:local_poc(OnionKeyHash) of
-                            {error, _} ->
-                                %% clients should retry after a period of time
-                                {error, <<"queued_poc">>};
-                            {ok, #local_poc{block_hash = BlockHash, target = Challengee, onion = Onion}} ->
-                                e2qc:evict(local_pocs, OnionKeyHash),
-                                {true, Onion};
-                            {ok, #local_poc{block_hash = BlockHash, target = _OtherTarget}} ->
-                                e2qc:evict(local_pocs, OnionKeyHash),
-                                false;
-                            {ok, #local_poc{block_hash = _OtherBlockHash, target = _Target}} ->
-                                e2qc:evict(local_pocs, OnionKeyHash),
-                                {error, <<"mismatched_block_hash">>}
-                        end;
+        %% PoC key should exist if gws are checking if target
+        %% if it doesn't exist could have been GC
+        case ?MODULE:local_poc_key(OnionKeyHash) of
+            {ok, _LocalKey} ->
+                %% PoC key exists check if `local_poc` was initialized
+                %% use e2qc to speed up this process since multiple gws
+                %% will be knocking on this function per target zone
+                LocalPOC = e2qc:cache(
+                    local_pocs,
+                    OnionKeyHash,
+                    fun() -> ?MODULE:local_poc(OnionKeyHash) end
+                ),
+                case LocalPOC of
+                    {error, not_found} ->
+                        lager:debug("~p *** keys exist poc could not be found", [OnionKeyHash]),
+                        %% Last cache resulted in no local poc ... evict the {error, not_found}
+                        %% to force the e2qc:cache to fire ?MODULE:local_poc on next hit attempt
+                        e2qc:evict(local_pocs, OnionKeyHash),
+                        {error, <<"queued_poc">>};
+                    {ok, #local_poc{block_hash = BlockHash, target = Challengee, onion = Onion}} ->
+                        {true, Onion};
+                    {ok, #local_poc{block_hash = BlockHash, target = OtherTarget}} ->
+                        lager:debug("~p *** gw ~p is not the target", [OnionKeyHash, OtherTarget]),
+                        false;
+                    {ok, #local_poc{block_hash = OtherBlockHash, target = Target}} ->
+                        lager:debug("~p *** gw ~p is target ~p but returned wrong block hash ~p", [OnionKeyHash, Target, Target == Challengee, OtherBlockHash]),
+                        {error, <<"mismatched_block_hash">>};
                     _ ->
-                        lager:debug("~p is NOT a known key", [OnionKeyHash]),
-                        {error, <<"invalid_or_expired_poc">>}
-                end;
-            {ok, #local_poc{block_hash = BlockHash, target = Challengee, onion = Onion}} ->
-                {true, Onion};
-            {ok, #local_poc{block_hash = BlockHash, target = _OtherTarget}} ->
-                false;
-            {ok, #local_poc{block_hash = _OtherBlockHash, target = _Target}} ->
-                {error, <<"mismatched_block_hash">>};
-            _ ->
-                false
+                        false
+                end
+            not_found ->
+                lager:debug("~p *** keys for poc could not be found", [OnionKeyHash]),
+                {error, <<"poc_keys_not_found">>};
+            Error ->
+                {error, list_to_binary(Error)}
         end,
-    lager:info("*** check target result for key ~p: ~p", [OnionKeyHash, Res]),
+    lager:info("~p *** check target result: ~p", [OnionKeyHash, Res]),
     Res.
 
 -spec report(
@@ -946,6 +934,9 @@ write_local_poc(#local_poc{onion_key_hash=OnionKeyHash} = LocalPOC, #state{db=DB
 -spec delete_local_poc( OnionKeyHash ::binary(),
                         State :: state()) -> ok.
 delete_local_poc(OnionKeyHash, #state{db=DB, local_pocs_cf=CF}) ->
+    %% Clear the cache on purge of local_pocs to ensure performance
+    %% gained from cache is maintained until end of life of PoC
+    e2qc:evict(local_pocs, OnionKeyHash),
     rocksdb:delete(DB, CF, OnionKeyHash, []).
 
 -spec write_local_poc_keys( KeySet ::local_poc_key(),
