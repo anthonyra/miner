@@ -951,4 +951,3 @@ write_local_poc_keys(LocalPOCKey = #poc_local_key_data{onion_key_hash = OnionKey
                              CF :: rocksdb:cf_handle()) -> ok.
 delete_local_poc_keys(OnionKeyHash, DB, CF) ->
     rocksdb:delete(DB, CF, OnionKeyHash, []).
-
